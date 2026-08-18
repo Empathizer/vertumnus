@@ -40,7 +40,7 @@ def check_windows(torch) -> None:
             "  2. Confirm your NVIDIA driver is current (580.82+).\n"
             "  3. Re-run setup.bat.\n"
             "If it still fails, switch to the nightly cu128 line in setup.bat:\n"
-            "  pip install --pre torch torchvision torchaudio "
+            "  pip install --pre torch torchaudio "
             "--index-url https://download.pytorch.org/whl/nightly/cu128"
         )
         return
@@ -70,8 +70,8 @@ def check_windows(torch) -> None:
             "This is the classic sm_120 kernel mismatch: your torch build does "
             "not include Blackwell (sm_120) kernels.\n"
             "Fix: switch to the NIGHTLY cu128 line.\n"
-            "  1. pip uninstall torch torchvision torchaudio\n"
-            "  2. pip install --pre torch torchvision torchaudio "
+            "  1. pip uninstall torch torchaudio\n"
+            "  2. pip install --pre torch torchaudio "
             "--index-url https://download.pytorch.org/whl/nightly/cu128\n"
             "  3. Re-run this script."
         )
@@ -125,9 +125,9 @@ def main() -> None:
         fail(
             "PyTorch is not installed.\n"
             "Install it separately (never via requirements.txt).\n"
-            "Windows (cu128): pip install torch torchvision torchaudio "
+            "Windows (cu128): pip install torch torchaudio "
             "--index-url https://download.pytorch.org/whl/cu128\n"
-            "macOS: pip install torch torchvision torchaudio"
+            "macOS: pip install torch torchaudio"
         )
         return
 

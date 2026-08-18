@@ -93,14 +93,14 @@ NOT include sm_120 kernels and will crash with "no kernel image is available
 for execution on the device":
 
 ```
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
 If `check_gpu.py`'s CUDA matmul crashes with that error, switch to the
 nightly cu128 line (commented in `setup.bat`):
 
 ```
-pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+pip install --pre torch torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 ```
 
 The CUDA runtime + cuDNN ship bundled inside the torch wheel — do not install
@@ -138,7 +138,7 @@ This app does not bundle any pretrained voices. You need:
    py -3.10 -m venv venv
    venv\Scripts\activate.bat
    python -m pip install "pip<24.1"
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
    pip install -r requirements.txt
    ```
    Then download the pretrained base checkpoints and HuBERT into

@@ -28,7 +28,7 @@ echo "=== Setting pip version ==="
 python -m pip install "pip<24.1"
 
 echo "=== Installing PyTorch (standard build: MPS/CPU, no CUDA on Mac) ==="
-pip install torch torchvision torchaudio
+pip install torch torchaudio
 
 echo "=== Installing remaining backend dependencies ==="
 pip install -r requirements.txt
