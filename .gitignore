@@ -1,0 +1,35 @@
+# Python
+backend/venv/
+__pycache__/
+*.pyc
+
+# User-supplied voice models & retrieval indexes (never bundled)
+backend/models/*.pth
+backend/models/*.index
+backend/models/hubert_base.pt
+
+# User presets (personal, local)
+backend/presets/*.json
+
+# Personal test recordings
+backend/test_audio/*.wav
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/src-tauri/target/
+# NOTE: icons/ is intentionally NOT ignored — Tauri needs them present to
+# bundle the installer, so they must be committed, not treated as a
+# regenerable local-only build artifact.
+
+# Separate external training tool (its own git repo, multi-GB venv/assets —
+# set up locally per README, not part of this repo) and personal recordings.
+rvc_training/
+training_data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code project-local tooling config, not app code
+.claude/
