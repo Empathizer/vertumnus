@@ -1,0 +1,51 @@
+name: Build Windows installer
+
+# Produces the Tauri shell's .exe/.msi installer only — NOT the Python/RVC
+# backend (that's a separate, multi-GB, GPU-specific environment set up on
+# the target PC itself via setup.bat; see README).
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # needed to publish the GitHub Release below
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build Tauri app (NSIS installer)
+        working-directory: frontend
+        run: npm run tauri build
+
+      # Published as a GitHub Release asset rather than a workflow artifact:
+      # Release assets use separate storage from the Actions artifact quota
+      # (which this account had already hit from unrelated usage), and it
+      # gives a permanent, stable download link instead of a 90-day-expiring
+      # build artifact. "latest-build" is a rolling tag — each run replaces
+      # the previous release/asset, so the link never changes.
+      - name: Publish installer as a GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest-build --yes --cleanup-tag || true
+          gh release create latest-build \
+            frontend/src-tauri/target/release/bundle/nsis/*.exe \
+            --repo "${{ github.repository }}" \
+            --title "Vertumnus (latest Windows build)" \
+            --notes "Automatically built from commit ${{ github.sha }}. Frontend shell only — see README for the one-time backend setup (setup.bat)." \
+            --latest
