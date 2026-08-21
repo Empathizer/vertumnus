@@ -7,6 +7,8 @@ __pycache__/
 backend/models/*.pth
 backend/models/*.index
 backend/models/hubert_base.pt
+# DDSP-SVC trained voices: backend/models/{name}/model.pt + config.yaml
+backend/models/*/
 
 # User presets (personal, local)
 backend/presets/*.json
@@ -22,10 +24,18 @@ frontend/src-tauri/target/
 # bundle the installer, so they must be committed, not treated as a
 # regenerable local-only build artifact.
 
-# Separate external training tool (its own git repo, multi-GB venv/assets —
-# set up locally per README, not part of this repo) and personal recordings.
+# Separate external training tools (each its own git repo, multi-GB
+# venv/pretrained-assets — set up locally per README, not part of this repo)
+# and personal recordings.
 rvc_training/
+ddsp_training/
 training_data/
+
+# Backend startup diagnostic logs (written by the Tauri shell next to the
+# app, see frontend/src-tauri/src/main.rs's spawn_backend)
+tauri_backend_stdout.log
+tauri_backend_stderr.log
+tauri_backend_spawn_error.log
 
 # OS
 .DS_Store

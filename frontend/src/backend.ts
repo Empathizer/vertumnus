@@ -12,8 +12,10 @@ export interface DeviceInfo {
 
 export interface VoiceModelInfo {
   name: string;
+  engine: "rvc" | "ddsp";
   pth_path: string;
   index_path: string | null;
+  config_path: string | null;
 }
 
 export interface EffectParams {

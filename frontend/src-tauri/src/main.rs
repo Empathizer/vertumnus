@@ -71,6 +71,17 @@ fn spawn_backend(backend_path: &Path) -> Option<Child> {
     cmd.arg("-u").arg("-m").arg("server.ws_server");
     cmd.current_dir(backend_path);
 
+    // DIAGNOSTIC: capture the backend's stdout/stderr to a log file, since
+    // windows_subsystem="windows" means this process has no console at all
+    // and any eprintln!/child output is normally completely invisible.
+    if let (Ok(out), Ok(err)) = (
+        fs::File::create(backend_path.join("..").join("tauri_backend_stdout.log")),
+        fs::File::create(backend_path.join("..").join("tauri_backend_stderr.log")),
+    ) {
+        cmd.stdout(out);
+        cmd.stderr(err);
+    }
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -83,7 +94,10 @@ fn spawn_backend(backend_path: &Path) -> Option<Child> {
     match cmd.spawn() {
         Ok(child) => Some(child),
         Err(e) => {
-            eprintln!("Vertumnus: failed to start backend process: {e}");
+            let _ = fs::write(
+                backend_path.join("..").join("tauri_backend_spawn_error.log"),
+                format!("failed to start backend process: {e}"),
+            );
             None
         }
     }

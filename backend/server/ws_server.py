@@ -171,13 +171,18 @@ async def handle_message(ws, raw: str) -> None:
         elif msg_type == "load_voice":
             pipeline.load_voice(
                 pth_path=msg["pth_path"],
+                engine=msg.get("engine", "rvc"),
                 index_path=msg.get("index_path"),
+                config_path=msg.get("config_path"),
                 index_rate=msg.get("index_rate", 0.75),
                 f0_up_key=msg.get("f0_up_key", 0),
                 f0_method=msg.get("f0_method", "harvest"),
-                block_time=msg.get("block_time", 0.25),
-                crossfade_time=msg.get("crossfade_time", 0.05),
-                extra_time=msg.get("extra_time", 2.5),
+                block_time=msg.get("block_time"),
+                crossfade_time=msg.get("crossfade_time"),
+                extra_time=msg.get("extra_time"),
+                infer_step=msg.get("infer_step", 30),
+                t_start=msg.get("t_start", 0.7),
+                sampling_method=msg.get("sampling_method", "euler"),
             )
             await broadcast({"type": "voice_loaded", "pth_path": msg["pth_path"]})
 

@@ -13,3 +13,12 @@ ffmpeg-python
 fairseq==0.12.2
 websockets
 tqdm
+
+# DDSP-SVC (rectified-flow) real-time inference -- runs in-process here
+# alongside RVC, same as rvc.engine/rvc.streaming above.
+PyYAML
+transformers
+resampy
+matplotlib  # nsf_hifigan/utils.py imports this unconditionally even though
+            # it's only used by a training-time plotting helper never called
+            # during inference

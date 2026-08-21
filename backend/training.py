@@ -1,17 +1,22 @@
 """
-In-app voice model training: drives the separate rvc_training/ tool (its own
+In-app voice model training: drives the separate ddsp_training/ tool (its own
 venv, own dependency set — deliberately isolated from the real-time
-inference backend's venv) through the same steps we validated manually:
-preprocess -> F0 extraction -> feature extraction -> train -> build index ->
-copy the result into backend/models/ so it shows up in the app's voice list.
+inference backend's venv, mirroring how rvc_training/ was isolated) through
+DDSP-SVC's rectified-flow pipeline: split train/val -> preprocess (pitch,
+units, volume extraction) -> train -> copy the result into backend/models/
+so it shows up in the app's voice list.
+
+New training always goes through DDSP-SVC (not RVC) — RVC training crashes
+reliably on this machine's Blackwell GPU during the discriminator's backward
+pass (a genuine, unfixed PyTorch/CUDA kernel bug, confirmed across stable and
+nightly builds); DDSP-SVC's rectified-flow objective has no discriminator
+and doesn't touch that broken kernel. RVC's real-time inference path
+(backend/rvc/, backend/ddsp_engine/) is unaffected and stays available for
+existing/other RVC models.
 
 Runs in a background thread; reports progress via a callback so the
-websocket server can broadcast it live. Training is CPU/GPU-heavy and can
-take anywhere from minutes (small dataset, few epochs, GPU) to hours (CPU) —
-this module only orchestrates it, it doesn't make it fast.
+websocket server can broadcast it live.
 """
-import json
-import os
 import platform
 import re
 import shutil
@@ -21,23 +26,30 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-import faiss
+import librosa
 import numpy as np
+import os
+import soundfile as sf
+import yaml
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
-TRAINING_TOOL_DIR = PROJECT_ROOT / "rvc_training"
+DDSP_TOOL_DIR = PROJECT_ROOT / "ddsp_training"
 # venv layout differs by platform: Windows uses Scripts\python.exe, POSIX
 # uses bin/python3.10 (or bin/python — 3.10 explicitly since that's the
 # only version this whole project supports).
 if platform.system() == "Windows":
-    TRAINING_VENV_PYTHON = TRAINING_TOOL_DIR / "venv" / "Scripts" / "python.exe"
+    DDSP_VENV_PYTHON = DDSP_TOOL_DIR / "venv" / "Scripts" / "python.exe"
 else:
-    TRAINING_VENV_PYTHON = TRAINING_TOOL_DIR / "venv" / "bin" / "python3.10"
+    DDSP_VENV_PYTHON = DDSP_TOOL_DIR / "venv" / "bin" / "python3.10"
 MODELS_DIR = BACKEND_DIR / "models"
 
-SAMPLE_RATE = 40000  # matches the pretrained_v2 base checkpoints we downloaded
-VERSION = "v2"
+DDSP_BASE_CONFIG = DDSP_TOOL_DIR / "configs" / "reflow.yaml"
+DDSP_SAMPLE_RATE = 44100  # matches configs/reflow.yaml's data.sampling_rate
+
+VAL_HOLDOUT_FRACTION = 0.10
+VAL_HOLDOUT_MAX_SECONDS = 60.0
+VAL_HOLDOUT_MIN_SECONDS = 6.0
 
 
 class TrainingError(Exception):
@@ -60,7 +72,7 @@ def _popen_extra_kwargs() -> dict:
 
 @dataclass
 class TrainingProgress:
-    stage: str  # "preprocess" | "f0" | "features" | "train" | "index" | "done" | "error"
+    stage: str  # "preprocess" | "train" | "done" | "error"
     message: str
     fraction: float  # 0..1, best-effort within the current stage
 
@@ -73,84 +85,52 @@ def _sanitize_name(name: str) -> str:
 
 
 def _check_prereqs() -> None:
-    if not TRAINING_VENV_PYTHON.is_file():
+    if not DDSP_VENV_PYTHON.is_file():
         raise TrainingError(
-            f"Training tool venv not found at {TRAINING_VENV_PYTHON}. "
-            f"Run rvc_training/venv setup first (see README)."
+            f"Training tool venv not found at {DDSP_VENV_PYTHON}. "
+            f"Set up ddsp_training/venv first (see README)."
         )
-    for fname in ("f0G40k.pth", "f0D40k.pth"):
-        if not (TRAINING_TOOL_DIR / "assets" / "pretrained_v2" / fname).is_file():
-            raise TrainingError(f"Missing pretrained base checkpoint: {fname} in rvc_training/assets/pretrained_v2/")
-    if not (TRAINING_TOOL_DIR / "assets" / "hubert" / "hubert_base.pt").is_file():
-        raise TrainingError("Missing rvc_training/assets/hubert/hubert_base.pt")
+    if not (DDSP_TOOL_DIR / "pretrain" / "contentvec" / "pytorch_model.bin").is_file():
+        raise TrainingError("Missing ddsp_training/pretrain/contentvec/pytorch_model.bin")
+    if not (DDSP_TOOL_DIR / "pretrain" / "rmvpe" / "model.pt").is_file():
+        raise TrainingError("Missing ddsp_training/pretrain/rmvpe/model.pt")
+    for fname in ("model", "config.json"):
+        if not (DDSP_TOOL_DIR / "pretrain" / "nsf_hifigan" / fname).is_file():
+            raise TrainingError(f"Missing ddsp_training/pretrain/nsf_hifigan/{fname}")
 
 
+def _split_train_val(source_path: Path, work_dir: Path, sample_rate: int) -> tuple[Path, Path]:
+    """Loads source_path and takes the LAST min(10%, 60s) (but at least 6s —
+    below that, everything just goes to train and val gets whatever's left
+    over) as validation, everything before that as train. Resamples to
+    sample_rate, writes work_dir/train/audio/{stem}.wav and
+    work_dir/val/audio/{stem}.wav.
 
+    DDSP-SVC (unlike RVC) accepts whole long .wav files directly — no
+    pre-slicing into short segments needed, its own AudioDataset samples
+    random duration-second crops per training step."""
+    audio, _ = librosa.load(str(source_path), sr=sample_rate, mono=True)
+    total_seconds = len(audio) / sample_rate
 
-def _build_filelist_and_config(exp_dir: Path, exp_name: str) -> None:
-    gt_wavs_dir = exp_dir / "0_gt_wavs"
-    feature_dir = exp_dir / "3_feature768"
-    f0_dir = exp_dir / "2a_f0"
-    f0nsf_dir = exp_dir / "2b-f0nsf"
+    val_seconds = min(total_seconds * VAL_HOLDOUT_FRACTION, VAL_HOLDOUT_MAX_SECONDS)
+    if val_seconds < VAL_HOLDOUT_MIN_SECONDS:
+        val_seconds = min(VAL_HOLDOUT_MIN_SECONDS, total_seconds * 0.5)
+    val_samples = max(1, int(val_seconds * sample_rate))
 
-    names = (
-        {p.stem for p in gt_wavs_dir.glob("*")}
-        & {p.stem for p in feature_dir.glob("*")}
-        & {p.stem.replace(".wav", "") for p in f0_dir.glob("*")}
-        & {p.stem.replace(".wav", "") for p in f0nsf_dir.glob("*")}
-    )
-    if not names:
-        raise TrainingError(
-            "No matching preprocessed segments across gt_wavs/features/f0 — "
-            "the source recording may be too short or silent."
-        )
+    train_audio = audio[:-val_samples] if val_samples < len(audio) else audio[:1]
+    val_audio = audio[-val_samples:]
 
-    # Use Path joining throughout, not manual "/" string concatenation —
-    # mixing a Path's native separator (backslash on Windows) with a
-    # hardcoded "/" produces mixed-separator paths like
-    # "C:\...\0_gt_wavs/name.wav", which is fragile across the various
-    # libraries (numpy, soundfile, this training tool's own loader) that
-    # read these filelist lines back.
-    lines = []
-    for name in names:
-        lines.append(
-            f"{gt_wavs_dir / (name + '.wav')}|{feature_dir / (name + '.npy')}|"
-            f"{f0_dir / (name + '.wav.npy')}|{f0nsf_dir / (name + '.wav.npy')}|0"
-        )
-    mute_dir = TRAINING_TOOL_DIR / "logs" / "mute"
-    for _ in range(2):
-        lines.append(
-            f"{mute_dir / '0_gt_wavs' / 'mute40k.wav'}|{mute_dir / '3_feature768' / 'mute.npy'}|"
-            f"{mute_dir / '2a_f0' / 'mute.wav.npy'}|{mute_dir / '2b-f0nsf' / 'mute.wav.npy'}|0"
-        )
-    import random
-    random.shuffle(lines)
-    (exp_dir / "filelist.txt").write_text("\n".join(lines))
+    train_dir = work_dir / "train" / "audio"
+    val_dir = work_dir / "val" / "audio"
+    train_dir.mkdir(parents=True, exist_ok=True)
+    val_dir.mkdir(parents=True, exist_ok=True)
 
-    config_src = TRAINING_TOOL_DIR / "configs" / "v1" / "40k.json"  # matches infer-web.py's own logic for 40k
-    config = json.loads(config_src.read_text())
-    (exp_dir / "config.json").write_text(json.dumps(config, ensure_ascii=False, indent=4, sort_keys=True))
-
-
-def _build_index(exp_dir: Path, exp_name: str) -> Path:
-    feature_dir = exp_dir / "3_feature768"
-    npys = [np.load(p) for p in sorted(feature_dir.glob("*.npy"))]
-    big_npy = np.concatenate(npys, axis=0)
-    idx = np.arange(big_npy.shape[0])
-    np.random.shuffle(idx)
-    big_npy = big_npy[idx]
-
-    n_ivf = max(1, min(int(16 * np.sqrt(big_npy.shape[0])), big_npy.shape[0] // 39))
-    index = faiss.index_factory(768, f"IVF{n_ivf},Flat")
-    index_ivf = faiss.extract_index_ivf(index)
-    index_ivf.nprobe = 1
-    index.train(big_npy)
-    for i in range(0, big_npy.shape[0], 8192):
-        index.add(big_npy[i : i + 8192])
-
-    out_path = exp_dir / f"added_IVF{n_ivf}_Flat_nprobe_1_{exp_name}_{VERSION}.index"
-    faiss.write_index(index, str(out_path))
-    return out_path
+    stem = source_path.stem
+    train_path = train_dir / f"{stem}.wav"
+    val_path = val_dir / f"{stem}.wav"
+    sf.write(train_path, train_audio, sample_rate)
+    sf.write(val_path, val_audio, sample_rate)
+    return train_path, val_path
 
 
 class TrainingManager:
@@ -177,11 +157,11 @@ class TrainingManager:
         self._thread.start()
 
     def cancel(self) -> None:
-        """Kills the currently-running step's whole process tree (train.py
-        spawns its own child worker processes via multiprocessing — killing
-        just the top process would orphan those). os.killpg/getpgid are
-        POSIX-only (don't exist on Windows at all — calling them there
-        raises AttributeError), so this branches per platform."""
+        """Kills the currently-running step's whole process tree (train_reflow.py
+        spawns its own dataloader worker processes — killing just the top
+        process would orphan those). os.killpg/getpgid are POSIX-only (don't
+        exist on Windows at all — calling them there raises AttributeError),
+        so this branches per platform."""
         self._cancelled = True
         if self._current_proc is None or self._current_proc.poll() is not None:
             return
@@ -227,6 +207,36 @@ class TrainingManager:
             tail = "".join(output_lines[-40:])
             raise TrainingError(f"Command failed: {' '.join(cmd)}\n{tail}")
 
+    def _write_generated_config(self, exp_name: str, epochs: int) -> Path:
+        """Clones configs/reflow.yaml with data.train_path/valid_path/env.expdir
+        rewritten to a fresh per-run location, and train.epochs/interval_val/
+        interval_force_save rewritten for this run's target length — same
+        role as RVC's old _build_filelist_and_config(), just YAML-key
+        rewriting instead of filelist/index math. A per-run copy avoids
+        racing/polluting the vendored default config across runs."""
+        with open(DDSP_BASE_CONFIG, "r") as f:
+            config = yaml.safe_load(f)
+
+        data_dir = DDSP_TOOL_DIR / "data" / "_generated" / exp_name
+        exp_dir = DDSP_TOOL_DIR / "exp" / exp_name
+
+        config["data"]["train_path"] = str(data_dir / "train")
+        config["data"]["valid_path"] = str(data_dir / "val")
+        config["env"]["expdir"] = str(exp_dir)
+        # Matches RVC's prior behavior (save_every_epoch == total_epoch: a
+        # single checkpoint at the very end), kept simple and predictable.
+        target = max(1, epochs)
+        config["train"]["epochs"] = target
+        config["train"]["interval_val"] = target
+        config["train"]["interval_force_save"] = target
+
+        generated_dir = DDSP_TOOL_DIR / "configs" / "_generated"
+        generated_dir.mkdir(parents=True, exist_ok=True)
+        config_path = generated_dir / f"{exp_name}.yaml"
+        with open(config_path, "w") as f:
+            yaml.safe_dump(config, f)
+        return config_path
+
     def _run(self, source_file_path: str, voice_name: str, epochs: int, on_progress) -> None:
         try:
             _check_prereqs()
@@ -235,54 +245,52 @@ class TrainingManager:
             if not source_path.is_file():
                 raise TrainingError(f"Source file not found: {source_file_path}")
 
-            input_dir = TRAINING_TOOL_DIR / "training_input" / exp_name
-            input_dir.mkdir(parents=True, exist_ok=True)
-            for old in input_dir.glob("*"):
-                old.unlink()
-            shutil.copy(source_path, input_dir / source_path.name)
+            py = str(DDSP_VENV_PYTHON)
 
-            exp_dir = TRAINING_TOOL_DIR / "logs" / exp_name
+            self._emit(on_progress, "preprocess", "Splitting into train/validation clips...", 0.0)
+            data_dir = DDSP_TOOL_DIR / "data" / "_generated" / exp_name
+            if data_dir.exists():
+                shutil.rmtree(data_dir)
+            _split_train_val(source_path, data_dir, DDSP_SAMPLE_RATE)
+
+            exp_dir = DDSP_TOOL_DIR / "exp" / exp_name
             if exp_dir.exists():
                 shutil.rmtree(exp_dir)
-            exp_dir.mkdir(parents=True)
+            config_path = self._write_generated_config(exp_name, epochs)
 
-            py = str(TRAINING_VENV_PYTHON)
-
-            self._emit(on_progress, "preprocess", "Slicing and normalizing audio...", 0.0)
+            self._emit(on_progress, "preprocess", "Extracting pitch/units/volume features...", 0.05)
             self._run_step(
-                [py, "infer/modules/train/preprocess.py", str(input_dir), str(SAMPLE_RATE), "4",
-                 str(exp_dir), "False", "3.7"],
-                cwd=TRAINING_TOOL_DIR,
+                [py, "preprocess.py", "-c", str(config_path)],
+                cwd=DDSP_TOOL_DIR,
             )
 
-            self._emit(on_progress, "f0", "Extracting pitch (F0)...", 0.0)
-            self._run_step(
-                [py, "infer/modules/train/extract/extract_f0_print.py", str(exp_dir), "4", "harvest"],
-                cwd=TRAINING_TOOL_DIR,
+            self._emit(on_progress, "train", f"Training (0/{epochs})...", 0.1)
+            training_output = self._run_training(config_path, epochs, on_progress)
+
+            # DDSP-SVC's train_reflow.py, same as RVC's train.py before it,
+            # never checks its own exit code against what actually happened
+            # inside — treat "no checkpoint produced" as the real failure
+            # signal, and surface whatever the process printed (e.g. a
+            # native crash traceback) instead of a bare file-missing message.
+            checkpoints = sorted(
+                exp_dir.glob("model_*.pt"),
+                key=lambda p: int(p.stem.split("_")[1]) if p.stem.split("_")[1].isdigit() else -1,
             )
+            if not checkpoints:
+                raise TrainingError(
+                    "Training did not produce a checkpoint — it crashed or was "
+                    f"killed before finishing (no model_*.pt in {exp_dir}). "
+                    f"Last training output:\n{training_output}"
+                )
+            latest = checkpoints[-1]
 
-            self._emit(on_progress, "features", "Extracting HuBERT content features...", 0.0)
-            self._run_step(
-                [py, "infer/modules/train/extract_feature_print.py", "cpu", "1", "0", "0", str(exp_dir), VERSION],
-                cwd=TRAINING_TOOL_DIR,
-            )
-
-            self._emit(on_progress, "train", "Preparing training config...", 0.0)
-            _build_filelist_and_config(exp_dir, exp_name)
-
-            self._emit(on_progress, "train", f"Training (0/{epochs} epochs)...", 0.0)
-            self._run_training(exp_dir, exp_name, epochs, on_progress)
-
-            self._emit(on_progress, "index", "Building retrieval index...", 0.0)
-            index_path = _build_index(exp_dir, exp_name)
-
-            weights_src = TRAINING_TOOL_DIR / "assets" / "weights" / f"{exp_name}.pth"
-            if not weights_src.is_file():
-                raise TrainingError(f"Training finished but no extracted checkpoint found at {weights_src}")
-
-            MODELS_DIR.mkdir(exist_ok=True)
-            shutil.copy(weights_src, MODELS_DIR / f"{exp_name}.pth")
-            shutil.copy(index_path, MODELS_DIR / f"{exp_name}.index")
+            self._emit(on_progress, "train", "Copying trained model...", 0.95)
+            dest_dir = MODELS_DIR / exp_name
+            if dest_dir.exists():
+                shutil.rmtree(dest_dir)
+            dest_dir.mkdir(parents=True)
+            shutil.copy(latest, dest_dir / "model.pt")
+            shutil.copy(exp_dir / "config.yaml", dest_dir / "config.yaml")
 
             self._emit(on_progress, "done", f"Done — {exp_name} is ready to load.", 1.0)
         except TrainingCancelled:
@@ -295,38 +303,63 @@ class TrainingManager:
             self.is_training = False
             self._current_proc = None
 
-    def _run_training(self, exp_dir: Path, exp_name: str, epochs: int, on_progress) -> None:
+    # Substrings that show up when the training subprocess dies from a native
+    # crash (e.g. a CUDA kernel access violation) rather than a clean Python
+    # exception. The vendored training tool's own exit code is useless for
+    # detecting this (see the comment in _run), so output content is the only
+    # signal available. Engine-agnostic — this exact mechanism was already
+    # validated against the RVC crash this machine is prone to.
+    _CRASH_SIGNATURES = (
+        "Windows fatal exception",
+        "Fatal Python error",
+        "Segmentation fault",
+    )
+
+    def _run_training(self, config_path: Path, epochs: int, on_progress) -> str:
         self._check_cancelled()
-        py = str(TRAINING_VENV_PYTHON)
-        cmd = [
-            py, "infer/modules/train/train.py",
-            "-e", exp_name, "-sr", "40k", "-f0", "1", "-bs", "4",
-            "-te", str(epochs), "-se", str(epochs),
-            "-pg", "assets/pretrained_v2/f0G40k.pth", "-pd", "assets/pretrained_v2/f0D40k.pth",
-            "-l", "1", "-c", "0", "-sw", "0", "-v", VERSION,
-        ]
+        py = str(DDSP_VENV_PYTHON)
+        cmd = [py, "train_reflow.py", "-c", str(config_path)]
+        # PYTHONFAULTHANDLER makes a native crash print a low-level thread/stack
+        # dump before the process dies, instead of vanishing with no diagnostic
+        # output at all — that dump is what _CRASH_SIGNATURES looks for below.
+        env = {**os.environ, "PYTHONFAULTHANDLER": "1"}
         proc = subprocess.Popen(
-            cmd, cwd=str(TRAINING_TOOL_DIR),
+            cmd, cwd=str(DDSP_TOOL_DIR), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
             **_popen_extra_kwargs(),
         )
         self._current_proc = proc
-        epoch_re = re.compile(r"Epoch:\s*(\d+)")
+        step_re = re.compile(r"step:\s*(\d+)")
         last_lines: list[str] = []
+        # DDSP-SVC's dataset can yield more than one batch per "epoch" for a
+        # real (non-trivial-length) training clip, so the step counter isn't
+        # always a clean 1:1 match with the "epoch" count reflected in
+        # train.epochs (confirmed empirically: step observed dropping back
+        # down mid-run before climbing past the target again). Track the
+        # running max so the reported fraction never visibly regresses, even
+        # though the underlying training is progressing correctly either way.
+        max_step_seen = 0
         for line in proc.stdout:
             last_lines.append(line)
-            if len(last_lines) > 60:
+            if len(last_lines) > 300:
                 last_lines.pop(0)
-            m = epoch_re.search(line)
+            m = step_re.search(line)
             if m:
-                epoch = int(m.group(1))
+                max_step_seen = max(max_step_seen, int(m.group(1)))
                 self._emit(
-                    on_progress, "train", f"Training ({epoch}/{epochs} epochs)...",
-                    min(epoch / epochs, 0.99),
+                    on_progress, "train", f"Training ({max_step_seen}/{epochs})...",
+                    min(0.1 + 0.85 * max_step_seen / max(1, epochs), 0.99),
                 )
         proc.wait()
         self._current_proc = None
         if self._cancelled:
             raise TrainingCancelled()
+        tail = "".join(last_lines[-60:])
         if proc.returncode != 0:
-            raise TrainingError(f"Training process failed:\n{''.join(last_lines[-40:])}")
+            raise TrainingError(f"Training process failed:\n{tail}")
+        if any(sig in "".join(last_lines) for sig in self._CRASH_SIGNATURES):
+            raise TrainingError(
+                "Training crashed (native error, likely a GPU/CUDA kernel "
+                f"failure) even though the process reported success:\n{tail}"
+            )
+        return tail

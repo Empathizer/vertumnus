@@ -25,6 +25,9 @@ import sounddevice as sd
 import torch
 
 from audio.dsp_chain import EffectChain, MicNoiseGate
+from ddsp_engine.engine import DDSPNotFoundError, DDSPVoice
+from ddsp_engine.loader import ModelLoadError as DDSPModelLoadError
+from ddsp_engine.streaming import DDSPRealtimeConverter
 from rvc.engine import HubertNotFoundError, RVCVoice
 from rvc.loader import ModelLoadError
 from rvc.streaming import RealtimeConverter
@@ -142,8 +145,8 @@ class AudioPipeline:
         self.torch_device = torch_device
         self.effect_chain: EffectChain | None = None
         self.mic_gate: MicNoiseGate | None = None
-        self.voice: RVCVoice | None = None
-        self.converter: RealtimeConverter | None = None
+        self.voice: RVCVoice | DDSPVoice | None = None
+        self.converter: RealtimeConverter | DDSPRealtimeConverter | None = None
         self.latency = LatencyStats()
         self.underrun_count = 0
         self.muted = False
@@ -195,23 +198,31 @@ class AudioPipeline:
     def load_voice(
         self,
         pth_path: str,
+        engine: str = "rvc",
         index_path: str | None = None,
+        config_path: str | None = None,
         index_rate: float = 0.75,
         f0_up_key: int = 0,
         f0_method: str = "harvest",
-        block_time: float = 0.25,
-        crossfade_time: float = 0.05,
-        extra_time: float = 2.5,
+        block_time: float | None = None,
+        crossfade_time: float | None = None,
+        extra_time: float | None = None,
+        infer_step: int = 30,
+        t_start: float = 0.7,
+        sampling_method: str = "euler",
     ) -> None:
         check_cuda_device(self.torch_device)
         try:
-            voice = RVCVoice(
-                pth_path=pth_path,
-                device=self.torch_device,
-                index_path=index_path,
-                index_rate=index_rate,
-            )
-        except (ModelLoadError, HubertNotFoundError) as e:
+            if engine == "ddsp":
+                voice = DDSPVoice(model_path=pth_path, device=self.torch_device)
+            else:
+                voice = RVCVoice(
+                    pth_path=pth_path,
+                    device=self.torch_device,
+                    index_path=index_path,
+                    index_rate=index_rate,
+                )
+        except (ModelLoadError, HubertNotFoundError, DDSPModelLoadError, DDSPNotFoundError) as e:
             raise PipelineError("model_not_found", str(e)) from e
         except RuntimeError as e:
             if "CUDA" in str(e) or "no kernel image" in str(e):
@@ -227,15 +238,28 @@ class AudioPipeline:
             self.stop()
 
         self.voice = voice
-        self.converter = RealtimeConverter(
-            voice,
-            self.torch_device,
-            block_time=block_time,
-            crossfade_time=crossfade_time,
-            extra_time=extra_time,
-            f0_up_key=f0_up_key,
-            f0_method=f0_method,
-        )
+        if engine == "ddsp":
+            self.converter = DDSPRealtimeConverter(
+                voice,
+                self.torch_device,
+                block_time=block_time if block_time is not None else 0.5,
+                crossfade_time=crossfade_time if crossfade_time is not None else 0.04,
+                extra_time=extra_time if extra_time is not None else 1.0,
+                f0_up_key=f0_up_key,
+                infer_step=infer_step,
+                t_start=t_start,
+                sampling_method=sampling_method,
+            )
+        else:
+            self.converter = RealtimeConverter(
+                voice,
+                self.torch_device,
+                block_time=block_time if block_time is not None else 0.25,
+                crossfade_time=crossfade_time if crossfade_time is not None else 0.05,
+                extra_time=extra_time if extra_time is not None else 2.5,
+                f0_up_key=f0_up_key,
+                f0_method=f0_method,
+            )
         self.effect_chain = EffectChain(sample_rate=voice.target_sample_rate)
 
         if was_running:

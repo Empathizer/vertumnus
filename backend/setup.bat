@@ -30,25 +30,17 @@ REM malformed version metadata that pip>=24.1 refuses to resolve. Pin below
 REM that line rather than using the latest pip.
 python -m pip install "pip<24.1"
 
-echo === Installing remaining backend dependencies ===
-REM Installed BEFORE torch on purpose: fairseq/torchcrepe both declare torch
-REM as their own dependency, and pip's resolver doesn't know our upcoming
-REM cu128 install is special — installing torch first and requirements.txt
-REM second let pip silently pull in a default CPU-only torch afterward and
-REM overwrite the cu128 build (confirmed on real hardware: check_gpu.py
-REM reported "torch version: 2.13.0+cpu" despite the cu128 line running
-REM without error earlier in the script). Torch is installed LAST instead,
-REM below, so it's always the final, authoritative install.
-pip install -r requirements.txt
-
 echo === Installing PyTorch (cu128 STABLE) ===
 echo NOTE: sm_120 (RTX 5060 Ti / Blackwell) requires a cu128 build of torch 2.7+.
 echo Do NOT install torch from requirements.txt.
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 REM If the stable line above does not yet support sm_120 on your system, comment the
 REM stable install above and uncomment the nightly line below instead:
-REM pip install --pre torch torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+REM pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+
+echo === Installing remaining backend dependencies ===
+pip install -r requirements.txt
 
 echo === Running GPU check ===
 python check_gpu.py

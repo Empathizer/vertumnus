@@ -12,6 +12,7 @@ import {
 // Picked file paths come from the native OS dialog — Windows paths use "\",
 // macOS/Linux use "/". Split on both so the displayed filename is correct
 // regardless of platform.
+
 function basename(path: string): string {
   const parts = path.split(/[/\\]/);
   return parts[parts.length - 1] ?? path;
@@ -118,6 +119,11 @@ export default function App() {
         case "status":
           setRunning(msg.running);
           setUsingFileInput(msg.running ? !!msg.file_input : false);
+          // A successful start means whatever the last error was (often a
+          // stale/invalid device selection) has been resolved — otherwise
+          // the banner stays stuck forever for anyone not loading a voice
+          // model (voice_loaded is the only other place this clears).
+          if (msg.running) setError(null);
           break;
         case "file_playback_finished":
           break;
@@ -236,7 +242,9 @@ export default function App() {
     client.send({
       type: "load_voice",
       pth_path: model.pth_path,
+      engine: model.engine,
       index_path: model.index_path,
+      config_path: model.config_path,
       f0_up_key: pitchKey,
     });
   }
@@ -400,13 +408,15 @@ export default function App() {
               <option key={m.pth_path} value={m.pth_path}>
                 {m.name}
                 {m.index_path ? " (+index)" : ""}
+                {m.engine === "ddsp" ? " [DDSP]" : ""}
               </option>
             ))}
           </select>
           <button onClick={() => client.send({ type: "list_voice_models" })}>Refresh</button>
         </div>
         <p className="hint">
-          Drop .pth (and optional same-named .index) files into <code>backend/models/</code>, then Refresh.
+          Drop .pth (and optional same-named .index) files into <code>backend/models/</code> for RVC voices, or a
+          folder containing model.pt + config.yaml for DDSP-SVC voices, then Refresh.
         </p>
         {voiceLoaded && <p className="hint ok-text">Loaded: {basename(voiceLoaded)}</p>}
         <label>
@@ -470,9 +480,8 @@ export default function App() {
         </div>
         <p className="hint">
           Pick a recording of the voice you want to clone (needs your rights to that voice — your own recording, or
-          one you're licensed to use). More epochs = better quality but longer training; this Mac trains at roughly
-          ~2-3 min/epoch on a short recording — much faster on the Windows RTX box. The trained model appears
-          automatically in the Voice model dropdown above when done.
+          one you're licensed to use). Trains a DDSP-SVC rectified-flow voice model on GPU. The trained model
+          appears automatically in the Voice model dropdown above when done, tagged [DDSP].
         </p>
         {(isTraining || trainStage) && (
           <div className="training-progress">
